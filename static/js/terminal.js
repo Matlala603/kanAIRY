@@ -1,301 +1,314 @@
-// Order ticket + positions / orders / history panel.
-import { h, icon, clear, toast, money, signed, cls, dt, $, num } from './util.js';
-import { S, on, emit, inst, digitsOf, isBroker } from './state.js';
+// Market watch + chart panel.
+import { h, icon, clear, $, toast, signed, cls, arrow, num } from './util.js';
+import { S, on, emit, inst, digitsOf, favorites, toggleFavorite, isBroker, persist, TFS, TF_SEC, drawingsFor, saveDrawings } from './state.js';
+import { candles, dayChange, refreshNow } from './market.js';
+import { Chart, DRAW_TOOLS } from './chart.js';
+import { REGISTRY, GROUPS, PALETTE, defaults } from './indicators.js';
+import { openSheet, contextMenu, promptSheet, confirmSheet } from './ui.js';
 import { api } from './api.js';
-import { refreshNow } from './market.js';
-import { brokerDirectory } from './connect.js';
-import { openSheet, confirmSheet } from './ui.js';
-import { hooks, pickSymbol, selectSymbol } from './terminal.js';
+
+export const hooks = { showScreen: () => {}, openTicket: () => {}, openConnect: () => {}, markers: [] };
 
 const fmt = (v, d) => (v == null || Number.isNaN(v) ? '—' : Number(v).toFixed(d));
-const pipSize = d => Math.pow(10, -(d >= 3 ? d - 1 : d === 2 ? 1 : d));
-const decimals = step => { const s = String(step); return s.includes('.') ? s.split('.')[1].length : 0; };
 
-// ---------------- order ticket ----------------
-export function mountTicket(root) {
-  const T = { type: 'market', pending: 'limit', volume: S.settings.defaultVolume || 0.01, price: '', limitPrice: '', sl: '', tp: '' };
-  let busy = false;
-
-  function draw() {
-    clear(root);
-    root.append(h('div', { class: 'panel-head' }, 'New order'));
-    if (!isBroker()) {
-      root.append(h('div', { class: 'ticket' },
-        h('div', { class: 'lock' }, h('b', {}, 'Connect a broker to trade'), h('p', {}, 'Prices and charts work without an account. To place orders, link your MetaTrader 4 or 5 account.'),
-          h('button', { class: 'btn primary', onclick: () => hooks.openConnect() }, icon('link', 16), 'Connect broker')),
-        h('div', { class: 'lbl' }, 'Available brokers'), brokerDirectory((name, servers, plat) => hooks.openConnect({ name, servers, plat }))));
-      return;
-    }
-    const i = inst(S.symbol) || {}, d = digitsOf(S.symbol);
-    const step = i.volumeStep || 0.01, vmin = i.minVolume || 0.01;
-    const sell = h('button', { class: 'sb sell', id: 'tkSell', onclick: () => place('sell') }, h('small', {}, 'Sell'), h('b', {}, '—'));
-    const buy = h('button', { class: 'sb buy', id: 'tkBuy', onclick: () => place('buy') }, h('small', {}, 'Buy'), h('b', {}, '—'));
-    const typeSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Order type', style: { width: '100%' } },
-      [['market', 'Market'], ['limit', 'Limit'], ['stop', 'Stop'], ['stop_limit', 'Stop-limit']].map(([k, l]) => h('button', { style: { flex: 1 }, 'aria-pressed': String(T.type === k), onclick: () => { T.type = k; draw(); } }, l)));
-    const vol = h('input', { class: 'input', id: 'tkVol', inputmode: 'decimal', value: T.volume, 'aria-label': 'Volume in lots', oninput: e => { T.volume = e.target.value; calc(); } });
-    const bump = dir => { const v = (num(T.volume) || 0) + dir * step; T.volume = Math.max(vmin, +v.toFixed(decimals(step))); vol.value = T.volume; calc(); };
-    const inputField = (key, label, ph) => h('div', { class: 'field' }, h('label', {}, label), h('input', { class: 'input', inputmode: 'decimal', placeholder: ph || 'Optional', value: T[key], 'aria-label': label, oninput: e => { T[key] = e.target.value; calc(); } }));
-    const slInput = inputField('sl', 'Stop loss (price)'), tpInput = inputField('tp', 'Take profit (price)');
-    const quickDist = (key, mult) => h('button', { class: 'chip', onclick: () => setDist(key, mult) }, `${key === 'sl' ? 'SL' : 'TP'} ${mult} pips`);
-    root.append(h('div', { class: 'ticket' },
-      h('button', { class: 'sym-btn', onclick: () => pickSymbol(selectSymbol), style: { padding: 0 } }, h('div', {}, h('div', { class: 's' }, S.symbol), h('div', { class: 'd' }, i.name || '')), icon('swap', 15)),
-      h('div', { class: 'sellbuy' }, sell, buy), h('div', { class: 'spreadline', id: 'tkSpread' }, ''),
-      typeSeg,
-      T.type !== 'market' ? h('div', { class: 'two' }, inputField('price', T.type === 'stop_limit' ? 'Stop trigger price' : 'Entry price', 'Price'), T.type === 'stop_limit' ? inputField('limitPrice', 'Limit price', 'Price') : h('div', { class: 'field' }, h('label', {}, 'Distance'), h('div', { class: 'input mute', id: 'tkDist' }, '—'))) : null,
-      h('div', { class: 'field' }, h('label', {}, `Volume (lots)${i.minVolume ? ` · min ${i.minVolume}${i.maxVolume ? `, max ${i.maxVolume}` : ''}` : ''}`),
-        h('div', { class: 'stepper' }, h('button', { 'aria-label': 'Decrease volume', onclick: () => bump(-1) }, '−'), vol, h('button', { 'aria-label': 'Increase volume', onclick: () => bump(1) }, '+'))),
-      h('div', { class: 'chips' }, [0.01, 0.05, 0.1, 0.5, 1].map(v => h('button', { class: 'chip', onclick: () => { T.volume = v; vol.value = v; calc(); } }, String(v)))),
-      h('div', { class: 'two' }, slInput, tpInput),
-      h('div', { class: 'chips' }, quickDist('sl', 10), quickDist('sl', 25), quickDist('tp', 20), quickDist('tp', 50), h('button', { class: 'chip', onclick: () => { T.sl = ''; T.tp = ''; draw(); } }, 'Clear')),
-      h('div', { class: 'info' }, h('div', {}, h('span', {}, 'Risk at stop'), h('b', { id: 'tkRisk' }, '—')), h('div', {}, h('span', {}, 'Potential at target'), h('b', { id: 'tkRew' }, '—')), h('div', {}, h('span', {}, 'Free margin'), h('b', { id: 'tkFree' }, '—'))),
-      h('div', { class: 'err', id: 'tkErr' }), h('p', { class: 'hint' }, 'Risk uses the symbol’s contract size and assumes your account currency matches the quote currency, so treat it as an estimate.')));
-    calc(); paintPrices();
-  }
-
-  function ref(side) {
-    const q = S.quotes[S.symbol]; if (!q) return null;
-    if (T.type === 'market') return side === 'buy' ? q.ask : q.bid;
-    return num(T.price) || null;
-  }
-  function setDist(key, pips) {
-    const side = T.side || 'buy', r = ref('buy') || ref('sell'); if (!r) return;
-    const dist = pips * pipSize(digitsOf(S.symbol)), d = digitsOf(S.symbol);
-    // stop loss goes against the side, take profit with it; default to the buy side until a side is clicked
-    const v = (key === 'sl') === (side === 'buy') ? r - dist : r + dist;
-    T[key] = v.toFixed(d); draw();
-  }
-  function calc() {
-    const i = inst(S.symbol) || {}, vol = num(T.volume), cs = i.contractSize || 100000, acc = S.account;
-    const entry = ref('buy') || ref('sell'), sl = num(T.sl), tp = num(T.tp), ccy = acc?.currency || 'USD';
-    const set = (id, v) => { const el = root.querySelector('#' + id); if (el) el.textContent = v; };
-    if (entry && vol > 0 && sl > 0) { const risk = Math.abs(entry - sl) * cs * vol; set('tkRisk', `${money(risk, ccy)} (${(risk / (acc?.balance || 1) * 100).toFixed(1)}%)`); } else set('tkRisk', '—');
-    if (entry && vol > 0 && tp > 0) set('tkRew', money(Math.abs(tp - entry) * cs * vol, ccy)); else set('tkRew', '—');
-    set('tkFree', acc ? money(acc.freeMargin, ccy) : '—');
-    const dist = root.querySelector('#tkDist'), q = S.quotes[S.symbol], p = num(T.price);
-    if (dist && q && p) dist.textContent = `${((p - q.bid) / pipSize(digitsOf(S.symbol))).toFixed(1)} pips from bid`;
-  }
-  function paintPrices() {
-    const q = S.quotes[S.symbol], d = digitsOf(S.symbol), s = root.querySelector('#tkSell b'), b = root.querySelector('#tkBuy b'), sp = root.querySelector('#tkSpread');
-    if (!s || !b) return;
-    const live = !!q && q.bid > 0 && q.ask > 0;
-    root.querySelectorAll('.sb').forEach(btn => { btn.disabled = busy || !live; btn.title = live ? '' : 'Waiting for a live price'; });   // never trade without a price
-    if (!live) { s.textContent = '\u2014'; b.textContent = '\u2014'; if (sp) sp.textContent = 'Waiting for a live price\u2026'; return; }
-    s.textContent = fmt(q.bid, d); b.textContent = fmt(q.ask, d);
-    sp.textContent = `Spread ${((q.ask - q.bid) / pipSize(d)).toFixed(1)} pips`;
-    calc();
-  }
-
-  function validate(side) {
-    const i = inst(S.symbol) || {}, q = S.quotes[S.symbol], vol = num(T.volume), d = digitsOf(S.symbol);
-    if (!q || !(q.bid > 0) || !(q.ask > 0)) return 'Waiting for a live price for this symbol.';
-    if (!(vol > 0)) return 'Enter a volume.';
-    if (i.minVolume && vol < i.minVolume - 1e-9) return `Minimum volume is ${i.minVolume} lots.`;
-    if (i.maxVolume && vol > i.maxVolume + 1e-9) return `Maximum volume is ${i.maxVolume} lots.`;
-    if (i.volumeStep) { const k = vol / i.volumeStep; if (Math.abs(k - Math.round(k)) > 1e-6) return `Volume must be a multiple of ${i.volumeStep}.`; }
-    const sl = T.sl === '' ? null : num(T.sl), tp = T.tp === '' ? null : num(T.tp);
-    if ((T.sl !== '' && !(sl > 0)) || (T.tp !== '' && !(tp > 0))) return 'Stop loss and take profit must be prices.';
-    let entry = side === 'buy' ? q.ask : q.bid;
-    if (T.type !== 'market') {
-      const p = num(T.price); if (!(p > 0)) return 'Enter the order price.';
-      if (T.type === 'limit' && (side === 'buy' ? p >= q.ask : p <= q.bid)) return side === 'buy' ? 'A buy limit must be below the current ask.' : 'A sell limit must be above the current bid.';
-      if (T.type === 'stop' && (side === 'buy' ? p <= q.ask : p >= q.bid)) return side === 'buy' ? 'A buy stop must be above the current ask.' : 'A sell stop must be below the current bid.';
-      if (T.type === 'stop_limit' && !(num(T.limitPrice) > 0)) return 'Enter the limit price.';
-      entry = p;
-    }
-    if (sl != null && (side === 'buy' ? sl >= entry : sl <= entry)) return side === 'buy' ? 'For a buy, the stop loss must be below the entry price.' : 'For a sell, the stop loss must be above the entry price.';
-    if (tp != null && (side === 'buy' ? tp <= entry : tp >= entry)) return side === 'buy' ? 'For a buy, the take profit must be above the entry price.' : 'For a sell, the take profit must be below the entry price.';
-    void d; return null;
-  }
-
-  async function place(side) {
-    if (busy) return; busy = true; root.querySelectorAll('.sb').forEach(b => { b.disabled = true; });
-    try { await placeInner(side); } finally { busy = false; paintPrices(); }
-  }
-  async function placeInner(side) {
-    T.side = side;
-    const err = root.querySelector('#tkErr'); err.textContent = '';
-    const bad = validate(side); if (bad) { err.textContent = bad; return; }
-    const d = digitsOf(S.symbol), q = S.quotes[S.symbol];
-    const body = { symbol: S.symbol, side, type: T.type, volume: num(T.volume) };
-    if (T.type !== 'market') body.price = num(T.price);
-    if (T.type === 'stop_limit') body.stopLimitPrice = num(T.limitPrice);
-    if (T.sl !== '') body.stopLoss = num(T.sl);
-    if (T.tp !== '') body.takeProfit = num(T.tp);
-    const acct = S.account;
-    if (S.settings.confirmOrders) {
-      const rows = [['Order', `${side.toUpperCase()} ${T.type.replace('_', '-')} ${body.volume} ${S.symbol}`], ['Price', T.type === 'market' ? `Market (${fmt(side === 'buy' ? q.ask : q.bid, d)})` : fmt(body.price, d)],
-        ['Stop loss', body.stopLoss ? fmt(body.stopLoss, d) : 'None'], ['Take profit', body.takeProfit ? fmt(body.takeProfit, d) : 'None'], ['Account', `${acct?.login || ''} · ${acct?.server || ''}`]];
-      const ok = await confirmSheet({ title: 'Confirm order', message: acct?.type === 'ACCOUNT_TRADE_MODE_REAL' || /real|live/i.test(acct?.server || '') ? 'This is a live account. Real money is at risk.' : 'Review the order before sending it to your broker.',
-        okText: `${side === 'buy' ? 'Buy' : 'Sell'} ${S.symbol}`, details: h('div', { class: 'info' }, rows.map(([k, v]) => h('div', {}, h('span', {}, k), h('b', {}, v)))) });
-      if (!ok) return;
-    }
-    // One id per order the user confirms. The server answers a repeat of the same id from the first result,
-    // so a slow or lost reply can never become a second position.
-    body.clientOrderId = newOrderId();
-    const done = r => {
-      toast(`${r.message || 'Order accepted'}${r.positionId ? ' · #' + r.positionId : ''}`, 'ok'); refreshNow();
-      if (T.type !== 'market') hooks.showScreen('positions');
-    };
-    try { done(await api.order(body)); }
-    catch (e) {
-      // No reply, a timeout or "could not confirm" does NOT mean the order failed: find out before saying anything.
-      if (e.status === 0 || e.status === 504 || e.code === 'order_unknown') {
-        err.textContent = 'Checking whether your order went through…';
-        const st = await settleOrder(body.clientOrderId);
-        if (st === 'executed' || st === 'working') { err.textContent = ''; toast('Your order went through. Check Positions.', 'ok'); refreshNow(); if (T.type !== 'market') hooks.showScreen('positions'); return; }
-        if (st === 'not_executed') { err.textContent = 'The order was not placed.'; toast('The order was not placed.', 'error'); return; }
-        err.textContent = 'We could not confirm this order. Check Positions and Orders before sending it again.';
-        toast(err.textContent, 'error'); refreshNow(); return;
-      }
-      err.textContent = e.message; toast(e.message, 'error');
-    }
-  }
-  const newOrderId = () => (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '') : (Date.now().toString(36) + Math.random().toString(36).slice(2))).slice(0, 20);
-  async function settleOrder(id) {
-    for (let i = 0; i < 4; i++) {
-      await new Promise(r => setTimeout(r, i === 0 ? 1500 : 3000));
-      try {
-        const { status } = await api.orderStatus(id);
-        if (['executed', 'working', 'not_executed'].includes(status)) return status;
-      } catch { /* try again */ }
-    }
-    return 'unknown';
-  }
-
-  hooks.openTicket = ({ side, type, price } = {}) => {
-    if (!isBroker()) { hooks.showScreen('trade'); return; }
-    if (type) { T.type = type; T.price = price != null ? String(price) : ''; }
-    else if (side && T.type !== 'market' && price == null) { /* keep pending settings */ }
-    draw(); hooks.showScreen('trade');
-    if (side && !type) { root.querySelector(side === 'buy' ? '#tkBuy' : '#tkSell')?.focus(); }
+// ---------------- symbol picker ----------------
+export function pickSymbol(onPick) {
+  const input = h('input', { type: 'search', placeholder: 'Search symbols…', 'aria-label': 'Search symbols' });
+  const list = h('div', { class: 'scroll', style: { maxHeight: '55vh' } });
+  const cats = ['All', ...new Set(S.instruments.map(i => i.cat))];
+  let cat = 'All';
+  const tabs = h('div', { class: 'tabs', style: { padding: '0 0 8px' } }, cats.map(c => h('button', { class: 'tab' + (c === cat ? ' on' : ''), onclick: e => { cat = c; tabs.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t === e.currentTarget)); draw(); } }, c)));
+  const draw = () => {
+    const q = input.value.trim().toLowerCase(); clear(list);
+    const rows = S.instruments.filter(i => (cat === 'All' || i.cat === cat) && (!q || (i.symbol + ' ' + i.name).toLowerCase().includes(q))).slice(0, 120);
+    if (!rows.length) list.append(h('div', { class: 'empty' }, h('b', {}, 'No symbols'), 'Try a different search or category.'));
+    rows.forEach(i => list.append(h('button', { class: 'bk-card', style: { marginBottom: '6px' }, onclick: () => { sheet.close(); onPick(i.symbol); } },
+      h('div', { class: 'grow' }, h('div', { class: 'n' }, i.symbol), h('div', { class: 'c' }, i.name)), h('span', { class: 'tag mute' }, i.cat))));
   };
-  on('quotes', paintPrices);
-  on('snapshot', calc);
-  on('symbol', () => { T.price = ''; T.limitPrice = ''; T.sl = ''; T.tp = ''; draw(); });
-  on('mode', draw); on('instruments', draw);
+  input.addEventListener('input', draw);
+  const sheet = openSheet({ title: 'Symbols', body: h('div', {}, h('div', { class: 'search', style: { margin: '0 0 8px' } }, icon('search', 16), input), tabs, list) });
   draw();
 }
 
-// ---------------- positions / orders / history ----------------
-export function mountPositions(root) {
-  let tab = 'positions', histDays = 30, deals = null, dealsErr = null;
-  const body = h('div', { class: 'scroll', style: { display: 'flex', flexDirection: 'column' } });
-  const bar = h('div', { class: 'acct-bar' });
-  const tabs = h('div', { class: 'tabs', style: { padding: '8px 12px', borderBottom: '1px solid var(--line)' } });
-  clear(root).append(tabs, body, bar);
+// ---------------- market watch ----------------
+export function mountWatchlist(root) {
+  const input = h('input', { type: 'search', placeholder: 'Search symbols', 'aria-label': 'Search symbols' });
+  const tabs = h('div', { class: 'tabs', role: 'tablist' });
+  const head = h('div', { class: 'qhead' }, h('span'), h('span', {}, 'Symbol'), h('span', {}, isBroker() ? 'Bid' : 'Price'), h('span', {}, isBroker() ? 'Ask' : ''), h('span', {}, 'Day'));
+  const list = h('div', { class: 'scroll' });
+  const rows = new Map();
+  clear(root).append(h('div', { class: 'panel-head' }, 'Market watch', h('span', { class: 'sub', id: 'wlCount' })), h('div', { class: 'search' }, icon('search', 16), input), tabs, head, list);
 
-  const drawTabs = () => {
-    clear(tabs).append(...[['positions', `Positions (${S.positions.length})`], ['orders', `Orders (${S.orders.length})`], ['history', 'History']].map(([k, l]) =>
-      h('button', { class: 'tab', 'aria-selected': String(tab === k), onclick: () => { tab = k; drawTabs(); render(true); if (k === 'history') loadHistory(); } }, l)));
-  };
-  function lock() {
-    return h('div', { class: 'empty' }, h('b', {}, 'No account connected'), 'Connect a MetaTrader account to see positions, pending orders and trade history.',
-      h('div', { style: { marginTop: '12px' } }, h('button', { class: 'btn primary', onclick: () => hooks.openConnect() }, icon('link', 16), 'Connect broker')));
+  function drawTabs() {
+    const cats = ['Favorites', ...[...new Set(S.instruments.map(i => i.cat))]];
+    clear(tabs).append(...cats.map(c => h('button', { class: 'tab', role: 'tab', 'aria-selected': String(c === S.catFilter), onclick: () => { S.catFilter = c; drawTabs(); drawList(); emit('watch'); } }, c)));
+    head.children[2].textContent = isBroker() ? 'Bid' : 'Price'; head.children[3].textContent = isBroker() ? 'Ask' : '';
   }
+  function visible() {
+    const q = input.value.trim().toLowerCase();
+    if (q) return S.instruments.filter(i => (i.symbol + ' ' + i.name).toLowerCase().includes(q));
+    if (S.catFilter === 'Favorites') { const f = favorites(); return f.map(inst).filter(Boolean); }
+    return S.instruments.filter(i => i.cat === S.catFilter);
+  }
+  function drawList() {
+    S.query = input.value.trim();
+    clear(list); rows.clear();
+    const items = visible();
+    $('#wlCount', root).textContent = items.length ? `${items.length}` : '';
+    if (!S.instruments.length) { for (let i = 0; i < 8; i++) list.append(h('div', { class: 'skeleton', style: { margin: '8px 12px', height: '44px' } })); return; }
+    if (!items.length) {
+      list.append(h('div', { class: 'empty' }, h('b', {}, S.catFilter === 'Favorites' && !S.query ? 'No favourites yet' : 'Nothing found'),
+        S.catFilter === 'Favorites' && !S.query ? 'Open a category and tap the star on any symbol to pin it here.' : 'Try another search or category.'));
+      return;
+    }
+    items.slice(0, 250).forEach(i => {
+      const fav = favorites().includes(i.symbol);
+      const row = h('div', { class: 'qrow' + (i.symbol === S.symbol ? ' sel' : ''), role: 'button', tabindex: '0', dataset: { sym: i.symbol },
+        onclick: () => { selectSymbol(i.symbol); hooks.showScreen('chart'); }, onkeydown: e => { if (e.key === 'Enter') row.click(); } },
+        h('button', { class: 'star' + (fav ? ' on' : ''), 'aria-label': fav ? 'Remove from favourites' : 'Add to favourites', onclick: e => { e.stopPropagation(); toggleFavorite(i.symbol); drawList(); } }, icon('star', 15)),
+        h('div', { style: { minWidth: 0 } }, h('div', { class: 'sym' }, i.symbol), h('div', { class: 'desc' }, i.name)),
+        h('div', { class: 'px', dataset: { f: 'bid' } }, '—'), h('div', { class: 'px', dataset: { f: 'ask' } }, '—'), h('div', { class: 'chg', dataset: { f: 'chg' } }, '—'));
+      rows.set(i.symbol, row); list.append(row); paint(i.symbol);
+    });
+  }
+  function paint(sym) {
+    const row = rows.get(sym), q = S.quotes[sym]; if (!row || !q) return;
+    const d = digitsOf(sym), bid = row.querySelector('[data-f=bid]'), ask = row.querySelector('[data-f=ask]'), chg = row.querySelector('[data-f=chg]');
+    const nb = fmt(q.bid, d);
+    if (bid.textContent !== nb) { if (bid.textContent !== '—') { bid.classList.remove('flash-up', 'flash-down'); void bid.offsetWidth; bid.classList.add(q.dir >= 0 ? 'flash-up' : 'flash-down'); } bid.textContent = nb; }
+    bid.className = 'px ' + (q.dir > 0 ? 'up' : q.dir < 0 ? 'down' : '') + (bid.classList.contains('flash-up') ? ' flash-up' : bid.classList.contains('flash-down') ? ' flash-down' : '');
+    ask.textContent = isBroker() ? fmt(q.ask, d) : '';
+    const dc = dayChange(sym);
+    chg.textContent = dc ? `${dc.pct >= 0 ? '+' : '−'}${Math.abs(dc.pct).toFixed(2)}%` : '—'; chg.className = 'chg ' + (dc ? cls(dc.pct) : '');
+  }
+  input.addEventListener('input', () => { drawList(); emit('watch'); });
+  on('quotes', () => rows.forEach((_, s) => paint(s)));
+  on('instruments', () => { if (!favorites().length && isBroker()) S.catFilter = S.instruments[0] ? S.instruments[0].cat : 'Favorites'; drawTabs(); drawList(); });
+  on('favorites', drawList);
+  on('mode', () => { S.catFilter = isBroker() && !favorites().length ? (S.instruments[0]?.cat || 'Favorites') : 'Favorites'; drawTabs(); drawList(); });
+  on('symbol', () => rows.forEach((row, s) => row.classList.toggle('sel', s === S.symbol)));
+  drawTabs(); drawList();
+}
 
-  let sig = '';
-  function render(force) {
-    if (!isBroker()) { sig = ''; clear(body).append(lock()); clear(bar); return; }
-    drawBar();
-    if (tab === 'positions') renderPositions(force);
-    else if (tab === 'orders') renderOrders();
-    else renderHistory();
-  }
+export function selectSymbol(sym) {
+  if (!sym) return;
+  S.symbol = sym; persist(); emit('symbol', sym);
+}
 
-  function drawBar() {
-    const a = S.account; if (!a) { clear(bar); return; }
-    const c = a.currency, tot = S.positions.reduce((s, p) => s + p.profit, 0);
-    clear(bar).append(...[['Balance', money(a.balance, c)], ['Equity', money(a.equity, c)], ['Margin', money(a.margin, c)], ['Free', money(a.freeMargin, c)], ['Level', a.marginLevel ? a.marginLevel.toFixed(0) + '%' : '—']].map(([k, v]) => h('span', {}, k, h('b', {}, v))),
-      h('span', {}, 'Open P/L', h('b', { class: cls(tot) }, signed(tot) + ' ' + c)));
-  }
+// ---------------- chart panel ----------------
+export function mountChart(root) {
+  let chart = null, loadCtl = null, tailTimer = null, loadId = 0, draftTool = null;
+  const symBtn = h('button', { class: 'sym-btn', onclick: () => pickSymbol(selectSymbol), 'aria-label': 'Change symbol' }, h('div', {}, h('div', { class: 's' }), h('div', { class: 'd' })), icon('swap', 15));
+  const px = h('div', { class: 'bigpx' }, '—'), chg = h('div', { class: 'bigchg mute' }, '');
+  const tfSeg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Timeframe' }, TFS.map(t => h('button', { 'aria-pressed': String(t === S.tf), onclick: () => setTf(t) }, t)));
+  const typeBtn = h('button', { class: 'tbtn', onclick: e => typeMenu(e) }, icon('chart', 16), h('span', { class: 'lbl-type' }, 'Candles'));
+  const indBtn = h('button', { class: 'tbtn', onclick: openIndicators }, icon('indicator', 16), 'Indicators');
+  const drawBtn = h('button', { class: 'tbtn', onclick: e => drawMenu(e) }, icon('draw', 16), 'Draw');
+  const alertBtn = h('button', { class: 'tbtn', onclick: () => addAlert() }, icon('bell', 16), 'Alert');
+  const wrap = h('div', { class: 'chart-wrap' });
+  const msg = h('div', { class: 'empty hide', style: { position: 'absolute', inset: '0', display: 'grid', placeContent: 'center', zIndex: 4, background: 'var(--chart-bg)' } });
+  const sellBtn = h('button', { class: 'qbtn sell', onclick: () => hooks.openTicket({ side: 'sell' }) }, 'Sell', h('small', {}, '—'));
+  const buyBtn = h('button', { class: 'qbtn buy', onclick: () => hooks.openTicket({ side: 'buy' }) }, 'Buy', h('small', {}, '—'));
+  const quick = h('div', { class: 'chart-quick' }, sellBtn, buyBtn);
+  const latest = h('button', { class: 'fab hide', onclick: () => chart.goLatest() }, 'Latest ›');
+  wrap.append(msg, quick, h('div', { class: 'chart-fab' }, latest));
+  clear(root).append(h('div', { class: 'chart-top' }, symBtn, h('div', {}, px, chg), h('div', { class: 'tools' }, tfSeg, typeBtn, indBtn, drawBtn, alertBtn)), wrap);
 
-  function renderPositions(force) {
-    const ps = S.positions, s = ps.map(p => p.id + p.stopLoss + p.takeProfit + p.volume).join('|');
-    if (!force && s === sig && body.dataset.tab === 'positions') { ps.forEach(p => { body.querySelectorAll(`[data-pid="${p.id}"] [data-f=profit]`).forEach(el => { el.textContent = signed(p.profit); el.className = (el.dataset.r ? 'r ' : '') + cls(p.profit); }); body.querySelectorAll(`[data-pid="${p.id}"] [data-f=cur]`).forEach(el => { el.textContent = fmt(p.currentPrice, digitsOf(p.symbol)); }); }); return; }
-    sig = s; clear(body).dataset.tab = 'positions';
-    if (!ps.length) { body.append(h('div', { class: 'empty' }, h('b', {}, 'No open positions'), 'Orders you place appear here instantly.')); return; }
-    const d = p => digitsOf(p.symbol);
-    const actions = p => h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => modify(p) }, 'Edit'), h('button', { class: 'btn sm', onclick: () => partial(p) }, 'Part'), h('button', { class: 'btn sm danger', onclick: () => closePos(p) }, 'Close'));
-    const table = h('table', { class: 't' }, h('thead', {}, h('tr', {}, ['Symbol', 'Type', 'Volume', 'Open', 'Price', 'SL', 'TP', 'Swap', 'Profit', ''].map((t, i) => h('th', { class: i > 1 && i < 9 ? 'r' : '' }, t)))),
-      h('tbody', {}, ps.map(p => h('tr', { dataset: { pid: p.id } }, h('td', {}, h('b', {}, p.symbol)), h('td', {}, h('span', { class: 'pill ' + p.side }, p.side)), h('td', { class: 'r' }, p.volume), h('td', { class: 'r' }, fmt(p.openPrice, d(p))),
-        h('td', { class: 'r', dataset: { f: 'cur' } }, fmt(p.currentPrice, d(p))), h('td', { class: 'r' }, p.stopLoss ? fmt(p.stopLoss, d(p)) : '—'), h('td', { class: 'r' }, p.takeProfit ? fmt(p.takeProfit, d(p)) : '—'),
-        h('td', { class: 'r' }, signed(p.swap)), h('td', { class: 'r ' + cls(p.profit), dataset: { f: 'profit', r: '1' } }, signed(p.profit)), h('td', {}, actions(p))))));
-    const cards = h('div', { class: 'cards' }, ps.map(p => h('div', { class: 'pcard', dataset: { pid: p.id } },
-      h('div', { class: 'top' }, h('div', {}, h('b', {}, p.symbol), ' ', h('span', { class: 'pill ' + p.side }, `${p.side} ${p.volume}`)), h('b', { class: cls(p.profit), dataset: { f: 'profit' } }, signed(p.profit))),
-      h('div', { class: 'meta' }, h('span', {}, `Open ${fmt(p.openPrice, d(p))}`), h('span', {}, h('span', {}, 'Now '), h('span', { dataset: { f: 'cur' } }, fmt(p.currentPrice, d(p))))),
-      h('div', { class: 'meta' }, h('span', {}, `SL ${p.stopLoss ? fmt(p.stopLoss, d(p)) : '—'}`), h('span', {}, `TP ${p.takeProfit ? fmt(p.takeProfit, d(p)) : '—'}`)), actions(p))));
-    body.append(h('div', { class: 'table-wrap' }, table), cards);
-  }
+  const TYPES = [['candles', 'Candles'], ['hollow', 'Hollow candles'], ['heikin', 'Heikin-Ashi'], ['bars', 'OHLC bars'], ['line', 'Line'], ['area', 'Area']];
+  const typeLabel = () => TYPES.find(t => t[0] === S.chartType)?.[1] || 'Candles';
+  function typeMenu(e) { const r = e.currentTarget.getBoundingClientRect(); contextMenu(r.left, r.bottom + 4, 'Chart type', TYPES.map(([k, l]) => ({ label: (S.chartType === k ? '✓ ' : '   ') + l, run: () => { S.chartType = k; persist(); chart.setType(k); typeBtn.querySelector('.lbl-type').textContent = l; } }))); }
 
-  function renderOrders() {
-    clear(body).dataset.tab = 'orders'; sig = '';
-    if (!S.orders.length) { body.append(h('div', { class: 'empty' }, h('b', {}, 'No pending orders'), 'Right-click (or long-press) a price on the chart to place a limit or stop order.')); return; }
-    const d = o => digitsOf(o.symbol);
-    const act = o => h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => editOrder(o) }, 'Edit'), h('button', { class: 'btn sm danger', onclick: () => cancel(o) }, 'Cancel'));
-    body.append(h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', {}, h('tr', {}, ['Symbol', 'Type', 'Volume', 'Price', 'SL', 'TP', 'Placed', ''].map((t, i) => h('th', { class: i > 1 && i < 6 ? 'r' : '' }, t)))),
-      h('tbody', {}, S.orders.map(o => h('tr', {}, h('td', {}, h('b', {}, o.symbol)), h('td', {}, h('span', { class: 'pill ' + o.side }, o.type.replace('_', ' '))), h('td', { class: 'r' }, o.volume), h('td', { class: 'r' }, fmt(o.price, d(o))), h('td', { class: 'r' }, o.stopLoss ? fmt(o.stopLoss, d(o)) : '—'), h('td', { class: 'r' }, o.takeProfit ? fmt(o.takeProfit, d(o)) : '—'), h('td', {}, dt(o.time)), h('td', {}, act(o))))))),
-      h('div', { class: 'cards' }, S.orders.map(o => h('div', { class: 'pcard' }, h('div', { class: 'top' }, h('div', {}, h('b', {}, o.symbol), ' ', h('span', { class: 'pill ' + o.side }, `${o.type.replace('_', ' ')} ${o.volume}`)), h('b', {}, fmt(o.price, d(o)))),
-        h('div', { class: 'meta' }, h('span', {}, `SL ${o.stopLoss ? fmt(o.stopLoss, d(o)) : '—'}`), h('span', {}, `TP ${o.takeProfit ? fmt(o.takeProfit, d(o)) : '—'}`)), act(o)))));
-  }
-
-  async function loadHistory() {
-    deals = null; dealsErr = null; renderHistory();
-    try { deals = (await api.history(histDays)).deals; } catch (e) { dealsErr = e.message; }
-    if (tab === 'history') renderHistory();
-  }
-  function renderHistory() {
-    clear(body).dataset.tab = 'history'; sig = '';
-    const seg = h('div', { class: 'seg', style: { margin: '10px 12px' } }, [7, 30, 90, 365].map(n => h('button', { 'aria-pressed': String(n === histDays), onclick: () => { histDays = n; loadHistory(); } }, n === 365 ? '1y' : n + 'd')));
-    body.append(seg);
-    if (dealsErr) { body.append(h('div', { class: 'empty' }, h('b', {}, 'History unavailable'), dealsErr, h('div', { style: { marginTop: '10px' } }, h('button', { class: 'btn sm', onclick: loadHistory }, 'Try again')))); return; }
-    if (!deals) { for (let i = 0; i < 4; i++) body.append(h('div', { class: 'skeleton', style: { margin: '6px 12px' } })); return; }
-    const closed = deals.filter(x => x.kind === 'deal' && x.entry !== 'in');
-    const net = closed.reduce((s, x) => s + x.profit + x.swap + x.commission, 0), wins = closed.filter(x => x.profit > 0).length;
-    body.append(h('div', { class: 'acct-bar', style: { borderTop: 0, borderBottom: '1px solid var(--line)' } }, h('span', {}, 'Closed deals', h('b', {}, closed.length)), h('span', {}, 'Win rate', h('b', {}, closed.length ? (wins / closed.length * 100).toFixed(0) + '%' : '—')), h('span', {}, 'Net', h('b', { class: cls(net) }, signed(net) + ' ' + (S.account?.currency || '')))));
-    if (!deals.length) { body.append(h('div', { class: 'empty' }, h('b', {}, 'No deals in this period'), 'Try a longer range.')); return; }
-    body.append(h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', {}, h('tr', {}, ['Time', 'Symbol', 'Type', 'Volume', 'Price', 'Profit'].map((t, i) => h('th', { class: i > 2 ? 'r' : '' }, t)))),
-      h('tbody', {}, deals.slice(0, 300).map(x => h('tr', {}, h('td', {}, dt(x.time)), h('td', {}, x.kind === 'balance' ? h('span', { class: 'mute' }, x.comment) : h('b', {}, x.symbol)),
-        h('td', {}, x.kind === 'balance' ? 'Balance' : h('span', { class: 'pill ' + x.side }, `${x.side} ${x.entry === 'in' ? 'in' : 'out'}`)), h('td', { class: 'r' }, x.kind === 'deal' ? x.volume : ''), h('td', { class: 'r' }, x.kind === 'deal' ? fmt(x.price, digitsOf(x.symbol)) : ''),
-        h('td', { class: 'r ' + cls(x.profit) }, x.profit ? signed(x.profit) : '—')))))),
-      h('div', { class: 'cards' }, deals.slice(0, 200).map(x => h('div', { class: 'pcard' }, h('div', { class: 'top' }, h('div', {}, h('b', {}, x.kind === 'balance' ? 'Balance' : x.symbol), ' ', x.kind === 'deal' ? h('span', { class: 'pill ' + x.side }, `${x.side} ${x.entry === 'in' ? 'in' : 'out'} ${x.volume}`) : null), h('b', { class: cls(x.profit) }, x.profit ? signed(x.profit) : '—')), h('div', { class: 'meta' }, h('span', {}, dt(x.time)), h('span', {}, x.kind === 'deal' ? fmt(x.price, digitsOf(x.symbol)) : x.comment))))));
-  }
-
-  // ----- actions -----
-  async function closePos(p) {
-    const ok = await confirmSheet({ title: 'Close position', message: `Close ${p.side.toUpperCase()} ${p.volume} ${p.symbol} at market? Floating P/L is ${signed(p.profit)}.`, okText: 'Close position', danger: true }); if (!ok) return;
-    try { await api.closePosition(p.id); toast('Position closed', 'ok'); refreshNow(); } catch (e) { toast(e.message, 'error'); }
-  }
-  async function partial(p) {
-    const inp = h('input', { class: 'input', inputmode: 'decimal', value: (p.volume / 2).toFixed(2), 'aria-label': 'Volume to close' });
-    const s = openSheet({ title: `Close part of ${p.symbol}`, body: h('div', { class: 'field' }, h('label', {}, `Volume to close (open: ${p.volume} lots)`), inp),
-      footer: [h('button', { class: 'btn', onclick: () => s.close() }, 'Cancel'), h('button', { class: 'btn primary', onclick: async () => {
-        const v = num(inp.value); if (!(v > 0 && v < p.volume)) { inp.classList.add('bad'); return; }
-        try { await api.closePosition(p.id, v); toast(`Closed ${v} lots`, 'ok'); s.close(); refreshNow(); } catch (e) { toast(e.message, 'error'); } } }, 'Close volume')] });
-  }
-  function levelsSheet(title, o, apply, withPrice) {
-    const d = digitsOf(o.symbol);
-    const price = withPrice ? h('input', { class: 'input', inputmode: 'decimal', value: fmt(o.price, d), 'aria-label': 'Price' }) : null;
-    const sl = h('input', { class: 'input', inputmode: 'decimal', value: o.stopLoss ? fmt(o.stopLoss, d) : '', placeholder: 'None', 'aria-label': 'Stop loss' });
-    const tp = h('input', { class: 'input', inputmode: 'decimal', value: o.takeProfit ? fmt(o.takeProfit, d) : '', placeholder: 'None', 'aria-label': 'Take profit' });
-    const err = h('div', { class: 'err' });
-    const s = openSheet({ title, body: h('div', { class: 'stack' }, h('p', { class: 'hint' }, 'Leave a field empty to remove it.'),
-      price ? h('div', { class: 'field' }, h('label', {}, 'Price'), price) : null, h('div', { class: 'field' }, h('label', {}, 'Stop loss'), sl), h('div', { class: 'field' }, h('label', {}, 'Take profit'), tp), err),
-      footer: [h('button', { class: 'btn', onclick: () => s.close() }, 'Cancel'), h('button', { class: 'btn primary', onclick: async () => {
-        const vals = { stopLoss: sl.value.trim() === '' ? 0 : num(sl.value), takeProfit: tp.value.trim() === '' ? 0 : num(tp.value) };
-        if (Number.isNaN(vals.stopLoss) || Number.isNaN(vals.takeProfit) || vals.stopLoss < 0 || vals.takeProfit < 0) { err.textContent = 'Enter valid prices.'; return; }
-        if (price) { vals.price = num(price.value); if (!(vals.price > 0)) { err.textContent = 'Enter a valid price.'; return; } }
-        try { await apply(vals); toast('Updated', 'ok'); s.close(); refreshNow(); } catch (e) { err.textContent = e.message; } } }, 'Save')] });
-  }
-  const modify = p => levelsSheet(`Edit ${p.symbol} position`, p, v => api.modifyPosition(p.id, v), false);
-  const editOrder = o => levelsSheet(`Edit ${o.symbol} order`, o, v => api.modifyOrder(o.id, v), true);
-  async function cancel(o) {
-    if (!await confirmSheet({ title: 'Cancel order', message: `Cancel ${o.type.replace('_', ' ')} ${o.volume} ${o.symbol} at ${fmt(o.price, digitsOf(o.symbol))}?`, okText: 'Cancel order', danger: true })) return;
-    try { await api.cancelOrder(o.id); toast('Order cancelled', 'ok'); refreshNow(); } catch (e) { toast(e.message, 'error'); }
+  function drawMenu(e) {
+    const r = e.currentTarget.getBoundingClientRect();
+    contextMenu(r.left, r.bottom + 4, 'Drawing tools', [
+      ...Object.entries(DRAW_TOOLS).map(([k, t]) => ({ label: t.name, run: () => { chart.setTool(k); draftTool = k; drawBtn.classList.add('on'); toast(t.pts === 1 ? 'Tap the chart to place it.' : 'Drag on the chart to draw. Esc cancels.'); } })),
+      { label: 'Delete selected', run: () => { if (!chart.deleteSelected()) toast('Tap a drawing to select it first.'); } },
+      { label: 'Clear all drawings', run: async () => { if (await confirmSheet({ title: 'Clear drawings', message: `Remove every drawing on ${S.symbol}?`, okText: 'Clear all', danger: true })) chart.clearDrawings(); } },
+    ]);
   }
 
-  on('snapshot', () => { drawTabs(); render(false); });
-  on('mode', () => { deals = null; drawTabs(); render(true); });
-  drawTabs(); render(true);
-  hooks.refreshPositions = () => { drawTabs(); render(true); };
-  void $; void emit;
+  function ensureChart() {
+    if (chart) return chart;
+    chart = new Chart(wrap, {
+      drawColor: null,
+      onNeedMore: loadOlder,
+      onDrawingsChange: list => saveDrawings(S.symbol, list),
+      onToolChange: () => { draftTool = null; drawBtn.classList.remove('on'); },
+      onTextRequest: cb => promptSheet({ title: 'Add text', label: 'Label', okText: 'Add' }).then(v => cb(v && v.trim())),
+      onIndicator: (uid, act) => { if (act === 'remove') removeIndicator(uid); else editIndicator(uid); },
+      onLevelDrag: handleLevelDrag,
+      onContext: handleContext,
+      onCrosshair: () => latest.classList.toggle('hide', chart.isAtEnd()),
+    });
+    chart.setType(S.chartType); applyIndicators();
+    new MutationObserver(() => chart.refreshTheme()).observe(document.documentElement, { attributes: true });
+    wrap.addEventListener('pointerup', () => setTimeout(() => latest.classList.toggle('hide', chart.isAtEnd()), 60));
+    wrap.addEventListener('wheel', () => setTimeout(() => latest.classList.toggle('hide', chart.isAtEnd()), 60), { passive: true });
+    return chart;
+  }
+
+  function header() {
+    const i = inst(S.symbol);
+    symBtn.querySelector('.s').textContent = S.symbol; symBtn.querySelector('.d').textContent = i?.name || '';
+    tfSeg.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.textContent === S.tf)));
+    typeBtn.querySelector('.lbl-type').textContent = typeLabel();
+  }
+  function setTf(t) { S.tf = t; persist(); header(); load(); }
+
+  function paintPrice() {
+    const q = S.quotes[S.symbol], d = digitsOf(S.symbol);
+    if (!q) return;
+    px.textContent = fmt(q.bid, d); px.className = 'bigpx ' + (q.dir > 0 ? 'up' : q.dir < 0 ? 'down' : '');
+    const dc = dayChange(S.symbol);
+    chg.textContent = dc ? `${arrow(dc.abs)} ${signed(dc.abs, d)} (${signed(dc.pct)}%)` : (isBroker() ? '' : 'Public feed'); chg.className = 'bigchg ' + (dc ? cls(dc.abs) : 'mute');
+    sellBtn.querySelector('small').textContent = fmt(q.bid, d); buyBtn.querySelector('small').textContent = isBroker() ? fmt(q.ask, d) : fmt(q.bid, d);
+    quick.classList.toggle('hide', !isBroker());
+  }
+
+  async function load() {
+    if (!S.instruments.length) return;
+    ensureChart(); loadCtl?.abort(); loadCtl = new AbortController(); const id = ++loadId;
+    clear(msg).classList.add('hide'); chart.setData([], {}); chart.opts.emptyText = 'Loading prices…';
+    header();
+    try {
+      const cs = await candles(S.symbol, S.tf, isBroker() ? 500 : 800, null, loadCtl.signal);
+      if (id !== loadId) return;
+      if (!cs.length) throw new Error('No price history for this symbol and timeframe yet.');
+      chart.setData(cs, { tfSeconds: TF_SEC[S.tf], digits: digitsOf(S.symbol) });
+      chart.setDrawings(drawingsFor(S.symbol)); chart.setMarkers(hooks.markers);
+      paintLevels(); paintQuote();
+      clearInterval(tailTimer); tailTimer = setInterval(refreshTail, isBroker() ? 5000 : 12000);
+    } catch (e) {
+      if (e.name === 'AbortError' || id !== loadId) return;
+      msg.classList.remove('hide'); clear(msg).append(h('b', {}, 'Chart unavailable'), h('div', { style: { margin: '4px 0 12px' } }, e.message), h('button', { class: 'btn sm', onclick: load }, 'Try again'));
+    }
+  }
+  async function refreshTail() {
+    if (document.hidden || !chart?.raw.length || $('body').dataset.group !== 'terminal') return;
+    try { const cs = await candles(S.symbol, S.tf, 4); chart.mergeTail(cs.slice(-4)); } catch { /* next tick */ }
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshTail(); });
+  async function loadOlder() {
+    if (!isBroker() || !chart.raw.length) return;
+    const id = loadId, first = chart.raw[0].t;
+    try { const cs = await candles(S.symbol, S.tf, 500, first); if (id === loadId) chart.prependCandles(cs); } catch { /* ignore */ }
+  }
+  function paintQuote() { const q = S.quotes[S.symbol]; if (chart) chart.setQuote(isBroker() && q ? q.bid : null, q?.ask); }
+
+  // ----- trade levels -----
+  function paintLevels() {
+    if (!chart) return;
+    const lv = [], d = digitsOf(S.symbol);
+    S.positions.filter(p => p.symbol === S.symbol).forEach(p => {
+      const c = p.side === 'buy' ? 'var(--up)' : 'var(--down)';
+      lv.push({ kind: 'position', id: p.id, price: p.openPrice, color: cssVar(p.side === 'buy' ? '--up' : '--down'), label: `${p.side.toUpperCase()} ${p.volume} · ${signed(p.profit)}` });
+      if (p.stopLoss) lv.push({ kind: 'sl', pos: p, price: p.stopLoss, color: cssVar('--down'), label: `SL ${fmt(p.stopLoss, d)}`, draggable: true });
+      if (p.takeProfit) lv.push({ kind: 'tp', pos: p, price: p.takeProfit, color: cssVar('--up'), label: `TP ${fmt(p.takeProfit, d)}`, draggable: true });
+      void c;
+    });
+    S.orders.filter(o => o.symbol === S.symbol).forEach(o => lv.push({ kind: 'order', order: o, price: o.price, color: cssVar('--warn'), label: `${o.type.replace('_', ' ').toUpperCase()} ${o.volume}`, draggable: true }));
+    S.alerts.filter(a => a.symbol === S.symbol && !a.fired).forEach(a => lv.push({ kind: 'alert', price: a.price, color: cssVar('--brand'), label: 'Alert' }));
+    chart.setLevels(lv);
+  }
+  const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim() || '#3d8bff';
+
+  async function handleLevelDrag(l, price) {
+    const d = digitsOf(S.symbol), p = +price.toFixed(d), q = S.quotes[S.symbol];
+    if (l.kind === 'sl' || l.kind === 'tp') {
+      const pos = S.positions.find(x => x.id === l.pos.id), label = l.kind === 'sl' ? 'stop loss' : 'take profit';
+      if (!pos) { toast('That position is no longer open.', 'error'); paintLevels(); return; }
+      const ref = q ? (pos.side === 'buy' ? q.bid : q.ask) : pos.currentPrice;
+      const wrongSide = l.kind === 'sl' ? (pos.side === 'buy' ? p >= ref : p <= ref) : (pos.side === 'buy' ? p <= ref : p >= ref);
+      if (wrongSide) { toast(`A ${label} for a ${pos.side} must be ${(l.kind === 'sl') === (pos.side === 'buy') ? 'below' : 'above'} the current price.`, 'error'); paintLevels(); return; }
+      const ok = await confirmSheet({ title: 'Move ' + label, message: `Move ${label} for ${pos.side.toUpperCase()} ${pos.symbol} (${pos.volume} lots) to ${p}?`, okText: 'Move' });
+      if (!ok) { paintLevels(); return; }
+      try { await api.modifyPosition(pos.id, l.kind === 'sl' ? { stopLoss: p } : { takeProfit: p }); toast('Updated ' + label, 'ok'); refreshNow(); }
+      catch (e) { toast(e.message, 'error'); paintLevels(); }
+    } else if (l.kind === 'order') {
+      const o = S.orders.find(x => x.id === l.order.id);
+      if (!o) { toast('That order is no longer pending.', 'error'); paintLevels(); return; }
+      if (o.type === 'buy_stop_limit' || o.type === 'sell_stop_limit') { toast('Edit stop-limit orders from the Orders tab.', 'error'); paintLevels(); return; }
+      const ok = await confirmSheet({ title: 'Move pending order', message: `Move ${o.type.replace('_', ' ')} ${o.symbol} to ${p}?`, okText: 'Move' });
+      if (!ok) { paintLevels(); return; }
+      try { await api.modifyOrder(o.id, { price: p }); toast('Order moved', 'ok'); refreshNow(); }
+      catch (e) { toast(e.message, 'error'); paintLevels(); }
+    }
+  }
+
+  function handleContext(c) {
+    const d = digitsOf(S.symbol), p = +c.price.toFixed(d), q = S.quotes[S.symbol];
+    const items = [];
+    if (isBroker() && q) {
+      const buyType = p < q.ask ? 'limit' : 'stop', sellType = p > q.bid ? 'limit' : 'stop';
+      items.push({ label: `Buy ${buyType} at ${p}`, run: () => hooks.openTicket({ side: 'buy', type: buyType, price: p }) });
+      items.push({ label: `Sell ${sellType} at ${p}`, run: () => hooks.openTicket({ side: 'sell', type: sellType, price: p }) });
+    }
+    items.push({ label: `Price alert at ${p}`, run: () => createAlert(p) });
+    items.push({ label: `Horizontal line at ${p}`, run: () => { const list = drawingsFor(S.symbol); list.push({ id: Date.now(), tool: 'hline', pts: [{ t: c.time, p }] }); saveDrawings(S.symbol, list); chart.setDrawings(list); } });
+    contextMenu(c.clientX, c.clientY, `${S.symbol} @ ${p}`, items);
+  }
+
+  function createAlert(price) {
+    const q = S.quotes[S.symbol]; if (!q) { toast('Waiting for a live price.', 'error'); return; }
+    S.alerts.push({ id: Date.now(), symbol: S.symbol, price, dir: price > q.bid ? 'above' : 'below', created: Date.now(), fired: false });
+    persist(); emit('alerts'); paintLevels();
+    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+    toast(`Alert set: ${S.symbol} ${price > q.bid ? 'rises to' : 'falls to'} ${price}`, 'ok');
+  }
+  async function addAlert() {
+    const q = S.quotes[S.symbol]; const d = digitsOf(S.symbol);
+    const v = await promptSheet({ title: `Alert for ${S.symbol}`, label: `Notify me when price reaches (now ${q ? fmt(q.bid, d) : '—'})`, type: 'number', value: q ? fmt(q.bid, d) : '', okText: 'Set alert' });
+    const n = num(v); if (v == null) return; if (!(n > 0)) { toast('Enter a valid price.', 'error'); return; } createAlert(n);
+  }
+
+  // ----- indicators -----
+  const nextUid = () => Math.max(0, ...S.indicators.map(i => i.uid)) + 1;
+  function applyIndicators() {
+    S.indicators.forEach((i, k) => { i.slot = k; i.color = i.color || PALETTE[k % PALETTE.length]; });
+    chart?.setIndicators(S.indicators.map(i => ({ ...i })));
+  }
+  function addIndicator(id) {
+    const colors = PALETTE.filter(c => !S.indicators.some(i => i.color === c));
+    S.indicators.push({ uid: nextUid(), id, params: defaults(id), color: colors[0] || PALETTE[S.indicators.length % PALETTE.length] });
+    persist(); applyIndicators(); toast(REGISTRY[id].name + ' added', 'ok');
+  }
+  function removeIndicator(uid) { S.indicators = S.indicators.filter(i => i.uid !== uid); persist(); applyIndicators(); }
+  function editIndicator(uid) {
+    const ind = S.indicators.find(i => i.uid === uid); if (!ind) return;
+    const def = REGISTRY[ind.id], inputs = {};
+    const color = h('input', { type: 'color', value: ind.color, 'aria-label': 'Colour', style: { width: '100%', height: '40px', border: 0, background: 'none' } });
+    const fields = (def.params || []).map(p => { const inp = h('input', { class: 'input', type: 'number', min: p.min, max: p.max, step: p.step, value: ind.params?.[p.key] ?? p.def }); inputs[p.key] = inp; return h('div', { class: 'field' }, h('label', {}, p.label), inp); });
+    const s = openSheet({ title: def.name, body: h('div', { class: 'stack' }, ...fields, h('div', { class: 'field' }, h('label', {}, 'Colour'), color)),
+      footer: [h('button', { class: 'btn danger', onclick: () => { removeIndicator(uid); s.close(); } }, 'Remove'),
+        h('button', { class: 'btn primary', onclick: () => { (def.params || []).forEach(p => { const v = num(inputs[p.key].value); ind.params[p.key] = Math.min(p.max, Math.max(p.min, Number.isFinite(v) ? v : p.def)); }); ind.color = color.value; persist(); applyIndicators(); s.close(); } }, 'Apply')] });
+  }
+  function openIndicators() {
+    const body = h('div', { class: 'stack' }); const sheet = openSheet({ title: 'Indicators', body });
+    const draw = () => {
+      clear(body);
+      if (S.indicators.length) body.append(h('div', {}, h('div', { class: 'lbl', style: { marginBottom: '6px' } }, 'On this chart'),
+        h('div', { class: 'chips' }, S.indicators.map(i => h('span', { class: 'chip', style: { borderColor: i.color, color: 'var(--text)' } }, REGISTRY[i.id].name.replace(/ \(.*\)/, ''), ' ',
+          h('button', { 'aria-label': 'Edit', onclick: () => { sheet.close(); editIndicator(i.uid); } }, '⚙'), ' ', h('button', { 'aria-label': 'Remove', onclick: () => { removeIndicator(i.uid); draw(); } }, '✕'))))));
+      GROUPS.forEach(([g, ids]) => body.append(h('div', {}, h('div', { class: 'lbl', style: { margin: '4px 0 6px' } }, g),
+        h('div', { class: 'chips' }, ids.map(id => h('button', { class: 'chip', onclick: () => { addIndicator(id); draw(); } }, '+ ', REGISTRY[id].name.replace(/ \(.*\)/, '')))))));
+    };
+    draw();
+  }
+
+  // ----- wiring -----
+  on('symbol', () => { header(); paintPrice(); load(); });
+  on('instruments', () => { header(); load(); });
+  on('mode', () => { header(); paintPrice(); load(); });
+  on('quotes', () => {
+    paintPrice(); paintQuote(); const q = S.quotes[S.symbol];
+    if (chart && q && q.bid) chart.tick(q.bid, q.time || Date.now() / 1000);
+  });
+  on('snapshot', paintLevels); on('alerts', paintLevels);
+  on('theme', () => chart?.refreshTheme());
+  on('markers', () => chart?.setMarkers(hooks.markers));
+  on('resize', () => chart?.resize());
+  header();
+  hooks.refreshChart = load;
+  hooks.chart = () => chart;
+  hooks.visible = () => { ensureChart(); chart.resize(); };
 }
