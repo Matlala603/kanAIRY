@@ -37,7 +37,7 @@ from broker_manager import (ApiError, BrokerManager, BrokerSession, ORDER_TYPES,
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("kanairy.mrpc")
-BUILD = "diag7-2026-10-10"
+BUILD = "diag9-2026-10-10"
 INSTANCE = uuid.uuid4().hex[:6]            # differs per running copy of the app: shows if two copies share the traffic
 DIAG: "deque[str]" = deque(maxlen=60)     # recent failures / first replies, served by /api/health/mrpc when MRPC_DEBUG=1
 log.warning("MetaRPC adapter loaded (build %s, instance %s)", BUILD, INSTANCE)
@@ -607,7 +607,7 @@ class MrpcManager(BrokerManager):
     def __init__(self, api_key: str, http: Optional[httpx.AsyncClient] = None, idle_seconds: int = 600, cred_ttl: int = 12 * 3600,
                  fallback_candles=None, fallback_symbols=None):
         self.token = api_key
-        self.max_quotes = max(1, int(os.getenv("MRPC_MAX_QUOTES", "15") or 15))   # price lookups per poll: too many starve the terminal
+        self.max_quotes = max(1, int(os.getenv("MRPC_MAX_QUOTES", "8") or 8))   # price lookups per poll: too many starve the terminal
         self.fallback_symbols = fallback_symbols           # async () -> list of symbol dicts (the app's instrument catalogue)
         self.broker_symbols = os.getenv("MRPC_BROKER_SYMBOLS", "").strip() not in ("", "0", "false")
         self.fallback_candles = fallback_candles           # async (symbol, timeframe, limit) -> rows; the public price feed
