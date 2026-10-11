@@ -76,7 +76,10 @@ export function mountTicket(root) {
   }
   function paintPrices() {
     const q = S.quotes[S.symbol], d = digitsOf(S.symbol), s = root.querySelector('#tkSell b'), b = root.querySelector('#tkBuy b'), sp = root.querySelector('#tkSpread');
-    if (!s || !q) return;
+    if (!s || !b) return;
+    const live = !!q && q.bid > 0 && q.ask > 0;
+    root.querySelectorAll('.sb').forEach(btn => { btn.disabled = busy || !live; btn.title = live ? '' : 'Waiting for a live price'; });   // never trade without a price
+    if (!live) { s.textContent = '\u2014'; b.textContent = '\u2014'; if (sp) sp.textContent = 'Waiting for a live price\u2026'; return; }
     s.textContent = fmt(q.bid, d); b.textContent = fmt(q.ask, d);
     sp.textContent = `Spread ${((q.ask - q.bid) / pipSize(d)).toFixed(1)} pips`;
     calc();
@@ -84,7 +87,7 @@ export function mountTicket(root) {
 
   function validate(side) {
     const i = inst(S.symbol) || {}, q = S.quotes[S.symbol], vol = num(T.volume), d = digitsOf(S.symbol);
-    if (!q) return 'Waiting for a live price for this symbol.';
+    if (!q || !(q.bid > 0) || !(q.ask > 0)) return 'Waiting for a live price for this symbol.';
     if (!(vol > 0)) return 'Enter a volume.';
     if (i.minVolume && vol < i.minVolume - 1e-9) return `Minimum volume is ${i.minVolume} lots.`;
     if (i.maxVolume && vol > i.maxVolume + 1e-9) return `Maximum volume is ${i.maxVolume} lots.`;
@@ -106,7 +109,7 @@ export function mountTicket(root) {
 
   async function place(side) {
     if (busy) return; busy = true; root.querySelectorAll('.sb').forEach(b => { b.disabled = true; });
-    try { await placeInner(side); } finally { busy = false; root.querySelectorAll('.sb').forEach(b => { b.disabled = false; }); }
+    try { await placeInner(side); } finally { busy = false; paintPrices(); }
   }
   async function placeInner(side) {
     T.side = side;
