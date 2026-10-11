@@ -6,6 +6,15 @@ export class ApiError extends Error {
 }
 
 let token = null;
+let diagOff = false, lastInstance = null; const diagSeen = {};
+// Connection diagnostics: sent to the server only while it runs with MRPC_DEBUG=1 (otherwise the first reply is a 404 and this stays silent).
+export function report(kind, msg) {
+  if (diagOff) return;
+  const k = kind + '|' + msg, now = Date.now();
+  if (diagSeen[k] && now - diagSeen[k] < 20000) return;
+  diagSeen[k] = now;
+  try { fetch('/api/diag', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ k: kind, m: String(msg).slice(0, 300) }), keepalive: true }).then(r => { if (r.status === 404) diagOff = true; }).catch(() => {}); } catch { /* ignore */ }
+}
 let onUnauth = () => {};
 export const setToken = t => { token = t; };
 export const onUnauthenticated = fn => { onUnauth = fn; };
@@ -14,7 +23,8 @@ async function call(method, path, { body, query, signal, auth = true, timeout = 
   const url = new URL(path, location.origin);
   if (query) Object.entries(query).forEach(([k, v]) => { if (v != null && v !== '') url.searchParams.set(k, v); });
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeout);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, timeout);
   signal?.addEventListener('abort', () => ctl.abort());
   let res;
   try {
@@ -24,11 +34,15 @@ async function call(method, path, { body, query, signal, auth = true, timeout = 
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
+    if (timedOut || e.name !== 'AbortError') report('net', `${method} ${path} ${timedOut ? 'timed out after ' + timeout + 'ms' : e.name}`);
     throw new ApiError(0, e.name === 'AbortError' ? 'The server took too long to answer.' : 'Cannot reach the server. Check your connection.', 'network');
   } finally { clearTimeout(timer); }
+  const inst = res.headers.get('X-Instance');
+  if (inst) { if (lastInstance && inst !== lastInstance) report('instance-change', `${lastInstance} -> ${inst}`); lastInstance = inst; }
   let data = null;
   try { data = await res.json(); } catch { /* empty body */ }
   if (!res.ok) {
+    report('http', `${method} ${path} -> ${res.status} ${data?.code || ''} ${data?.error || ''}`);
     const err = new ApiError(res.status, data?.error || data?.detail?.[0]?.msg || `Request failed (${res.status})`, data?.code);
     if (res.status === 401 && auth && token && ['unauthenticated', 'relink'].includes(err.code)) onUnauth(err);
     throw err;
@@ -46,9 +60,9 @@ export const api = {
   me: () => get('/api/auth/me'),
   logout: () => call('POST', '/api/auth/logout'),
   symbols: () => get('/api/market/symbols', { timeout: 60000 }),
-  quotes: (symbols, signal) => get('/api/market/quotes', { query: { symbols: symbols.join(',') }, signal }),
+  quotes: (symbols, signal) => get('/api/market/quotes', { query: { symbols: symbols.join(',') }, signal, timeout: 9000 }),
   candles: (symbol, timeframe, limit, before, signal) => get('/api/market/candles', { query: { symbol, timeframe, limit, before }, signal, timeout: 40000 }),
-  snapshot: signal => get('/api/trading/snapshot', { signal }),
+  snapshot: signal => get('/api/trading/snapshot', { signal, timeout: 12000 }),
   history: days => get('/api/trading/history', { query: { days }, timeout: 40000 }),
   order: body => call('POST', '/api/trading/order', { body, timeout: 40000 }),
   orderStatus: id => get('/api/trading/order-status/' + encodeURIComponent(id), { timeout: 15000 }),
@@ -57,7 +71,7 @@ export const api = {
   modifyOrder: (id, body) => call('PATCH', `/api/trading/orders/${encodeURIComponent(id)}`, { body, timeout: 40000 }),
   cancelOrder: id => call('DELETE', `/api/trading/orders/${encodeURIComponent(id)}`, { timeout: 40000 }),
   pubInstruments: () => get('/api/public/instruments', { auth: false }),
-  pubQuotes: (symbols, signal) => get('/api/public/quotes', { query: { symbols: symbols.join(',') }, auth: false, signal }),
+  pubQuotes: (symbols, signal) => get('/api/public/quotes', { query: { symbols: symbols.join(',') }, auth: false, signal, timeout: 9000 }),
   pubCandles: (symbol, timeframe, limit, signal) => get('/api/public/candles', { query: { symbol, timeframe, limit }, auth: false, signal, timeout: 40000 }),
   news: source => get('/api/news', { query: { source }, auth: false }),
   calendar: week => get('/api/calendar', { query: { week }, auth: false }),
