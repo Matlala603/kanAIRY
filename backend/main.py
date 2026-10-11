@@ -53,13 +53,19 @@ PROVIDER = (os.getenv("BROKER_PROVIDER") or ("metarpc" if _mrpc_key else "metaap
 IDLE_SECONDS = int(os.getenv("MRPC_IDLE_SECONDS", "600") or 600)
 
 
+async def _catalog_symbols():
+    """Symbol list for MetaRPC mode: MetaRPC has no cheap 'list all symbols' call, so use the app's own catalogue."""
+    return [{"symbol": c["symbol"], "description": c["name"], "category": c["cat"], "digits": c["digits"], "path": ""} for c in CATALOG]
+
+
 def get_manager() -> BrokerManager:
     global manager
     if manager is None:
         if PROVIDER == "metarpc":
             if not _mrpc_key:
                 raise ApiError(503, "Broker access is not configured. Set MRPC_API_KEY on the server.", "not_configured")
-            manager = MrpcManager(_mrpc_key, idle_seconds=IDLE_SECONDS, fallback_candles=public.candles)
+            manager = MrpcManager(_mrpc_key, idle_seconds=IDLE_SECONDS, fallback_candles=public.candles,
+                                  fallback_symbols=_catalog_symbols)
         else:
             if not _metaapi_token:
                 raise ApiError(503, "Broker access is not configured. Set METAAPI_TOKEN on the server.", "not_configured")
