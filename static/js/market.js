@@ -1,8 +1,17 @@
 // Market data layer: one interface over broker (MetaApi) and public feeds.
-import { api } from './api.js';
+import { api, report } from './api.js';
 import { S, active, isBroker, favorites, emit, inst } from './state.js';
 
 let quoteTimer = null, snapTimer = null, quoteCtl = null;
+let quoteBusy = false, snapBusy = false, lastOk = Date.now();
+const MAX_BROKER_QUOTES = 8;           // every broker price is a command the cloud terminal runs in turn: keep the list short
+
+// Connection status: a single slow or failed poll must not flash "Offline". Only a stretch with no success at all does.
+function markOk() { lastOk = Date.now(); if (!S.online) { S.online = true; report('status', 'back online'); emit('online'); } }
+function markFail(e) {
+  if (e?.name === 'AbortError' || e?.status === 401) return;
+  if (Date.now() - lastOk > 15000 && S.online) { S.online = false; report('status', `OFFLINE after 15s without a successful poll; last error: ${e?.status ?? ''} ${e?.message ?? ''}`); emit('online'); }
+}
 const dayRefAt = {};
 
 export async function loadInstruments() {
@@ -24,34 +33,37 @@ export async function candles(symbol, tf, limit = 500, before = null, signal) {
 
 // symbols we need prices for right now
 function watched() {
-  const set = new Set(favorites());
+  const set = new Set();
   set.add(S.symbol);
   S.positions.forEach(p => set.add(p.symbol)); S.orders.forEach(o => set.add(o.symbol));
   S.alerts.filter(a => !a.fired).forEach(a => set.add(a.symbol));
+  favorites().forEach(f => set.add(f));
   if (S.catFilter && S.catFilter !== 'Favorites') S.instruments.filter(i => i.cat === S.catFilter).slice(0, 30).forEach(i => set.add(i.symbol));
   if (S.query) S.instruments.filter(i => (i.symbol + i.name).toLowerCase().includes(S.query.toLowerCase())).slice(0, 20).forEach(i => set.add(i.symbol));
-  return [...set].filter(s => !S.instruments.length || inst(s));
+  return [...set].filter(s => s && (!S.instruments.length || inst(s)));
 }
 
 async function pollQuotes() {
-  if (document.hidden) return;
+  if (document.hidden || quoteBusy) return;               // never start a new request while one is still running
   const syms = watched(); if (!syms.length) return;
-  quoteCtl?.abort(); quoteCtl = new AbortController();
+  quoteBusy = true; quoteCtl = new AbortController();
   try {
-    const res = isBroker() ? (await api.quotes(syms.slice(0, 60), quoteCtl.signal)).quotes : (await api.pubQuotes(syms.slice(0, 40), quoteCtl.signal)).quotes;
+    const res = isBroker() ? (await api.quotes(syms.slice(0, MAX_BROKER_QUOTES), quoteCtl.signal)).quotes : (await api.pubQuotes(syms.slice(0, 40), quoteCtl.signal)).quotes;
+    const at = Date.now();
     for (const [s, q] of Object.entries(res)) {
       const prev = S.quotes[s];
-      S.quotes[s] = { ...prev, ...q, dir: prev ? Math.sign(q.bid - prev.bid) || prev.dir : 0 };
+      S.quotes[s] = { ...prev, ...q, at, dir: prev ? Math.sign(q.bid - prev.bid) || prev.dir : 0 };
     }
-    S.online = true; emit('quotes');
+    markOk(); emit('quotes');
     if (isBroker()) refreshDayRefs(syms);
-  } catch (e) { if (e.name !== 'AbortError') { S.online = false; emit('online'); } }
+  } catch (e) { markFail(e); }
+  finally { quoteBusy = false; }
 }
 
 // broker quotes carry no previous close; derive it from the last two daily candles
 async function refreshDayRefs(syms) {
   const now = Date.now();
-  for (const s of syms.slice(0, 12)) {
+  for (const s of syms.slice(0, 6)) {
     if (dayRefAt[s] && now - dayRefAt[s] < 600000) continue;
     dayRefAt[s] = now;
     try {
@@ -64,20 +76,22 @@ async function refreshDayRefs(syms) {
 }
 
 async function pollSnapshot() {
-  if (document.hidden || !isBroker()) return;
+  if (document.hidden || !isBroker() || snapBusy) return;
+  snapBusy = true;
   try {
     const snap = await api.snapshot();
     S.account = snap.account; S.positions = snap.positions; S.orders = snap.orders; S.lastSnapshot = Date.now();
-    S.online = true; emit('snapshot');
-  } catch (e) { if (e.status !== 401) { S.online = false; emit('online'); } }
+    markOk(); emit('snapshot');
+  } catch (e) { markFail(e); }
+  finally { snapBusy = false; }
 }
 
 export function startPolling() {
   stopPolling();
-  const qMs = isBroker() ? 1500 : 3000;
+  quoteBusy = false; snapBusy = false; lastOk = Date.now();
   pollQuotes(); pollSnapshot();
-  quoteTimer = setInterval(pollQuotes, qMs);
-  snapTimer = setInterval(pollSnapshot, 2000);
+  quoteTimer = setInterval(pollQuotes, 3000);
+  snapTimer = setInterval(pollSnapshot, isBroker() ? 3000 : 2000);
 }
 export function stopPolling() { clearInterval(quoteTimer); clearInterval(snapTimer); quoteCtl?.abort(); }
 export const refreshNow = () => { pollQuotes(); pollSnapshot(); };
