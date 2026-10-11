@@ -37,7 +37,7 @@ from broker_manager import (ApiError, BrokerManager, BrokerSession, ORDER_TYPES,
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("kanairy.mrpc")
-BUILD = "diag5-2026-10-10"
+BUILD = "diag6-2026-10-10"
 INSTANCE = uuid.uuid4().hex[:6]            # differs per running copy of the app: shows if two copies share the traffic
 DIAG: "deque[str]" = deque(maxlen=60)     # recent failures / first replies, served by /api/health/mrpc when MRPC_DEBUG=1
 log.warning("MetaRPC adapter loaded (build %s, instance %s)", BUILD, INSTANCE)
@@ -51,10 +51,10 @@ EP = {
     "account": "/AccountSummary",       # name VERIFIED, response fields not
     "opened": "/OpenedOrders",          # unverified
     "history": "/OrderHistory",         # unverified
-    "symbols": "/Symbols",              # unverified
-    "symbol_params": "/SymbolParams",   # unverified
-    "quote": "/GetQuote",               # unverified
-    "candles": "/PriceHistory",         # unverified
+    "symbols": "/SymbolParamsMany",     # method exists in the MT5 SDK; request parameters unverified (only used when MRPC_BROKER_SYMBOLS=1)
+    "symbol_params": "/SymbolParamsMany",
+    "quote": "/SymbolInfoTick",         # method name from the official MT5 SDK reference; params: symbol
+    "candles": "/PriceHistory",         # NOT in MetaRPC's MT5 API: only reachable with MRPC_BROKER_CANDLES=1, off by default
     "send": "/OrderSend",               # name VERIFIED, params not
     "close": "/OrderClose",             # unverified (also used to cancel a pending order)
     "modify": "/OrderModify",           # unverified
@@ -111,6 +111,12 @@ def _rows(res: Any, *keys: str) -> List[Dict[str, Any]]:
     if isinstance(res, dict):
         res = _g(res, *keys, default=[]) if keys else []
     return [r for r in (res or []) if isinstance(r, dict)]
+
+
+def _tick_time(v: Any) -> Optional[int]:
+    if isinstance(v, dict):
+        v = _g(v, "seconds", "sec", "unix")
+    return _epoch(v)
 
 
 def _flat(res: Any) -> Dict[str, Any]:
@@ -346,7 +352,16 @@ class MrpcSession(BrokerSession):
 
     # --- symbols / specification / prices
     async def symbols(self) -> List[Dict[str, Any]]:
-        raw = _unwrap(await self._cached("symbols", 600, lambda: self._call("symbols")))
+        raw = []
+        if self.mgr.broker_symbols:
+            try:
+                raw = _unwrap(await self._cached("symbols", 600, lambda: self._call("symbols")))
+            except ApiError:
+                raw = []
+        if isinstance(raw, dict):
+            raw = _g(raw, "symbols", "symbolParams", "items", default=[])
+        if not raw and self.mgr.fallback_symbols:
+            return await self.mgr.fallback_symbols()
         out = []
         for s in raw or []:
             d = s if isinstance(s, dict) else {"symbol": s}
@@ -380,7 +395,7 @@ class MrpcSession(BrokerSession):
 
     async def quotes(self, symbols: List[str]) -> Dict[str, Any]:
         self.last_used = time.time()
-        sem = asyncio.Semaphore(8)
+        sem = asyncio.Semaphore(4)                      # every call is a command the cloud terminal's single script must run in turn
 
         async def one(sym: str):
             async def fetch():
@@ -393,9 +408,9 @@ class MrpcSession(BrokerSession):
             bid, ask = _num(_g(q, "bid")), _num(_g(q, "ask"))
             if not bid and not ask:
                 return sym, None
-            return sym, {"bid": bid, "ask": ask, "time": _epoch(_g(q, "time", "timestamp")) or int(time.time())}
+            return sym, {"bid": bid, "ask": ask, "time": _tick_time(_g(q, "time", "timestamp", "timeMsc")) or int(time.time())}
 
-        pairs = await asyncio.gather(*(one(s) for s in symbols[:60]))
+        pairs = await asyncio.gather(*(one(s) for s in symbols[:self.mgr.max_quotes]))
         return {s: q for s, q in pairs if q}
 
     async def candles(self, symbol: str, timeframe: str, limit: int, before: Optional[int]) -> List[Dict[str, Any]]:
@@ -485,9 +500,9 @@ class MrpcSession(BrokerSession):
             spec = await self.spec(symbol)
         except (ApiError, MrpcError):
             spec = None
-        if not spec or not (_num(spec.get("minVolume")) or _num(spec.get("volumeStep"))):
-            raise ApiError(400, f"Could not read the contract specification for {symbol}. Try again in a moment.", "validation")
-        vmin, vmax, vstep = _num(spec.get("minVolume")), _num(spec.get("maxVolume")), _num(spec.get("volumeStep"))
+        vmin, vmax, vstep = (_num(spec.get("minVolume")), _num(spec.get("maxVolume")), _num(spec.get("volumeStep"))) if spec else (0, 0, 0)
+        if not (vmin or vstep):
+            log.warning("no contract spec for %s: volume limits are left to the broker", symbol)
         if vstep and abs(round(volume / vstep) * vstep - volume) > 1e-9 * max(1, volume / vstep):
             raise ApiError(400, f"Volume for {symbol} must be a multiple of {vstep} lots")
         if vmin and volume < vmin - 1e-12:
@@ -573,8 +588,11 @@ class MrpcManager(BrokerManager):
     """Same public surface as BrokerManager, backed by MetaRPC."""
 
     def __init__(self, api_key: str, http: Optional[httpx.AsyncClient] = None, idle_seconds: int = 600, cred_ttl: int = 12 * 3600,
-                 fallback_candles=None):
+                 fallback_candles=None, fallback_symbols=None):
         self.token = api_key
+        self.max_quotes = max(1, int(os.getenv("MRPC_MAX_QUOTES", "15") or 15))   # price lookups per poll: too many starve the terminal
+        self.fallback_symbols = fallback_symbols           # async () -> list of symbol dicts (the app's instrument catalogue)
+        self.broker_symbols = os.getenv("MRPC_BROKER_SYMBOLS", "").strip() not in ("", "0", "false")
         self.fallback_candles = fallback_candles           # async (symbol, timeframe, limit) -> rows; the public price feed
         self.broker_candles = os.getenv("MRPC_BROKER_CANDLES", "").strip() not in ("", "0", "false")
         self.client = MrpcHttp(api_key, http)
