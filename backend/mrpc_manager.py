@@ -37,7 +37,7 @@ from broker_manager import (ApiError, BrokerManager, BrokerSession, ORDER_TYPES,
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("kanairy.mrpc")
-BUILD = "diag6-2026-10-10"
+BUILD = "diag7-2026-10-10"
 INSTANCE = uuid.uuid4().hex[:6]            # differs per running copy of the app: shows if two copies share the traffic
 DIAG: "deque[str]" = deque(maxlen=60)     # recent failures / first replies, served by /api/health/mrpc when MRPC_DEBUG=1
 log.warning("MetaRPC adapter loaded (build %s, instance %s)", BUILD, INSTANCE)
@@ -403,15 +403,23 @@ class MrpcSession(BrokerSession):
                     return _unwrap(await self._call("quote", symbol=sym))
             try:
                 q = await self._cached("q:" + sym, 2.0, fetch)
-            except (ApiError, MrpcError):
+            except MrpcError:
+                return sym, None
+            except ApiError as e:
+                if e.code == "relink":
+                    raise
                 return sym, None
             bid, ask = _num(_g(q, "bid")), _num(_g(q, "ask"))
             if not bid and not ask:
                 return sym, None
             return sym, {"bid": bid, "ask": ask, "time": _tick_time(_g(q, "time", "timestamp", "timeMsc")) or int(time.time())}
 
-        pairs = await asyncio.gather(*(one(s) for s in symbols[:self.mgr.max_quotes]))
-        return {s: q for s, q in pairs if q}
+        wanted = symbols[:self.mgr.max_quotes]
+        pairs = await asyncio.gather(*(one(s) for s in wanted))
+        got = {s: q for s, q in pairs if q}
+        if wanted and not got:
+            raise ApiError(502, "No live prices are coming from your broker right now.", "upstream_error")
+        return got
 
     async def candles(self, symbol: str, timeframe: str, limit: int, before: Optional[int]) -> List[Dict[str, Any]]:
         if not self.mgr.broker_candles:
@@ -509,6 +517,15 @@ class MrpcSession(BrokerSession):
             raise ApiError(400, f"Minimum volume for {symbol} is {vmin} lots")
         if vmax and volume > vmax + 1e-12:
             raise ApiError(400, f"Maximum volume for {symbol} is {vmax} lots")
+        if otype == "market":
+            try:
+                live = await self.quotes([symbol])
+            except ApiError as e:
+                if e.code == "relink":
+                    raise
+                live = {}
+            if not live.get(symbol):
+                raise ApiError(400, f"No live price for {symbol} from your broker, so the order was not sent.", "validation")
         if otype != "market" and not price:
             raise ApiError(400, "A price is required for pending orders")
         if otype == "stop_limit" and not limit_price:
