@@ -123,6 +123,26 @@ def _limit(ip: str, limit: int = 8, window: int = 300, what: str = "connection a
 
 
 # ---------- health ----------
+@app.middleware("http")
+async def _instance_header(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers["X-Instance"] = MRPC_INSTANCE          # lets the browser notice if two copies of the app answer in turn
+    return resp
+
+
+@app.post("/api/diag")
+async def client_diag(request: Request):
+    """Browser-side connection events (only when MRPC_DEBUG=1). Contains no secrets: kind + short message."""
+    if os.getenv("MRPC_DEBUG", "").strip() in ("", "0", "false"):
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    try:
+        d = await request.json()
+        MRPC_DIAG.append(f"{time.strftime('%H:%M:%S')} CLIENT {str(d.get('k', ''))[:30]} | {str(d.get('m', ''))[:300]} | inst {MRPC_INSTANCE}")
+    except Exception:  # noqa: BLE001
+        pass
+    return JSONResponse({"ok": True})
+
+
 @app.get("/api/health/mrpc")
 async def health_mrpc():
     """Recent MetaRPC failures and the first reply of each call. Only when MRPC_DEBUG=1; turn it off afterwards."""
