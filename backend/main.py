@@ -6,6 +6,7 @@ economic calendar. Every account/trading route requires a signed session token.
 """
 import asyncio
 import logging
+import mimetypes
 import os
 import sys
 import time
@@ -30,6 +31,12 @@ from broker_manager import ApiError, BrokerManager, explain_error  # noqa: E402
 from mrpc_manager import BUILD as MRPC_BUILD, DIAG as MRPC_DIAG, INSTANCE as MRPC_INSTANCE, MrpcManager  # noqa: E402
 from models import ClosePositionRequest, ConnectRequest, ModifyRequest, OrderRequest  # noqa: E402
 from public_data import BY_SYMBOL, CATALOG, PublicData, PublicError  # noqa: E402
+
+# Some systems (notably Windows with odd registry entries) serve .js as text/plain, and browsers refuse
+# to run ES modules with that type: the page then loads but stays blank. Pin the types explicitly.
+for _ext, _type in ((".js", "application/javascript"), (".mjs", "application/javascript"), (".css", "text/css"),
+                    (".svg", "image/svg+xml"), (".json", "application/json"), (".webmanifest", "application/manifest+json")):
+    mimetypes.add_type(_type, _ext)
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
@@ -334,7 +341,23 @@ async def manifest():
     return FileResponse(STATIC / "manifest.json", media_type="application/manifest+json")
 
 
-app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+class _Static(StaticFiles):
+    """Static files that browsers revalidate every time, so a redeploy never leaves people on stale scripts."""
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        if path.endswith((".js", ".mjs")):
+            resp.headers["Content-Type"] = "application/javascript; charset=utf-8"
+        return resp
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse(STATIC / "img" / "icon.svg", media_type="image/svg+xml")
+
+
+app.mount("/static", _Static(directory=str(STATIC)), name="static")
 
 if __name__ == "__main__":
     import uvicorn
