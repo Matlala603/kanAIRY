@@ -49,7 +49,57 @@
 <div id="sheetRoot"></div>
 <div id="toast" role="status" aria-live="polite"></div>
 
+<div id="bootError" role="alert" hidden style="position:fixed;inset:0;z-index:9999;display:none;align-items:center;justify-content:center;padding:24px;background:#f6f7f9;color:#0e1116;font:15px/1.5 system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif">
+  <div style="max-width:460px;background:#fff;border:1px solid #e7e9ee;border-radius:18px;padding:24px;box-shadow:0 10px 30px rgba(14,17,22,.08)">
+    <h1 style="font-size:19px;margin:0 0 8px">KanAIRY could not start</h1>
+    <p id="bootMsg" style="margin:0 0 10px"></p>
+    <pre id="bootDetail" style="white-space:pre-wrap;word-break:break-word;font-size:12px;background:#f3f4f7;border-radius:10px;padding:10px;margin:0 0 14px;max-height:160px;overflow:auto"></pre>
+    <button id="bootReload" style="padding:10px 16px;border-radius:12px;border:0;background:#0e1116;color:#fff;font:inherit;cursor:pointer">Reload</button>
+    <button id="bootReset" style="padding:10px 16px;border-radius:12px;border:1px solid #e7e9ee;background:#fff;color:#0e1116;font:inherit;cursor:pointer;margin-left:8px">Clear app cache &amp; reload</button>
+  </div>
+</div>
+<script>
+/* Boot watchdog: runs before the app. If the app's JavaScript never starts (wrong MIME type, blocked or missing file,
+   old cached copy, page opened from disk) the person sees a clear message instead of a blank screen. */
+(function () {
+  var box = document.getElementById('bootError'), shown = false, details = [];
+  function show(msg) {
+    if (window.__kanairyBooted && !window.__kanairyFatal) return;
+    if (shown) { if (details.length) document.getElementById('bootDetail').textContent = details.join('\n'); return; }
+    shown = true;
+    document.getElementById('bootMsg').textContent = msg;
+    document.getElementById('bootDetail').textContent = details.join('\n');
+    box.hidden = false; box.style.display = 'flex';
+  }
+  window.__kanairyFail = function (msg, detail) { window.__kanairyFatal = true; if (detail) details.push(String(detail)); show(msg || 'Something went wrong while starting the app.'); };
+  window.addEventListener('error', function (e) {
+    if (window.__kanairyBooted) return;
+    var t = e.target;
+    if (t && t !== window && (t.src || t.href)) details.push('Could not load ' + (t.src || t.href));
+    else if (e.message) details.push(e.message);
+    show('Part of the app failed to load. Check that the server is running and that you opened the address it prints (for example http://localhost:8000).');
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    if (window.__kanairyBooted) return;
+    details.push(String((e.reason && e.reason.message) || e.reason || 'Unhandled error'));
+  });
+  if (location.protocol === 'file:') {
+    details.push('Address: ' + location.href);
+    show('This page was opened straight from a file. KanAIRY must be opened through its server (run ./start.sh, then visit http://localhost:8000).');
+  }
+  setTimeout(function () {
+    if (!window.__kanairyBooted) { details.push('Address: ' + location.href); show('The app did not start. Its JavaScript did not load or crashed. Try “Clear app cache & reload”.'); }
+  }, 8000);
+  document.getElementById('bootReload').onclick = function () { location.reload(); };
+  document.getElementById('bootReset').onclick = function () {
+    var jobs = [];
+    try { if (navigator.serviceWorker) jobs.push(navigator.serviceWorker.getRegistrations().then(function (rs) { return Promise.all(rs.map(function (r) { return r.unregister(); })); })); } catch (x) {}
+    try { if (window.caches) jobs.push(caches.keys().then(function (ks) { return Promise.all(ks.map(function (k) { return caches.delete(k); })); })); } catch (x) {}
+    Promise.all(jobs).catch(function () {}).then(function () { location.reload(); });
+  };
+})();
+</script>
 <script type="module" src="/static/js/main.js"></script>
-<noscript>KanAIRY needs JavaScript to run.</noscript>
+<noscript><div style="position:fixed;inset:0;z-index:9999;background:#fff;color:#0e1116;padding:24px;font:16px system-ui,sans-serif">KanAIRY needs JavaScript to run. Please enable JavaScript in your browser.</div></noscript>
 </body>
-</html>
+      </html>
