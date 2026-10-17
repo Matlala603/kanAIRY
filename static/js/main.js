@@ -91,7 +91,7 @@ async function enterMode(afterSwitch) {
   setToken(active()?.token || null);
   emit('mode'); paintAccount();
   try { await loadInstruments(); } catch (e) {
-    if (isBroker() && e.status !== 401) toast(e.message, 'error');
+    if (e.status !== 401) toast(isBroker() ? e.message : 'Could not reach the price server, so only a built-in symbol list is shown. ' + e.message, 'error');
   }
   if (!S.instruments.find(i => i.symbol === S.symbol) && S.instruments.length) selectSymbol((S.instruments.find(i => /^EURUSD/.test(i.symbol)) || S.instruments[0]).symbol);
   emit('mode'); startPolling(); paintAccount();
@@ -159,5 +159,6 @@ async function boot() {
   await enterMode();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
-boot().catch(e => { console.error(e); toast('Startup problem: ' + e.message, 'error'); });
+window.__kanairyBooted = true;   // modules loaded and evaluated; the boot watchdog in index.html stands down
+boot().catch(e => { console.error(e); window.__kanairyFail?.('The app hit an error while starting.', e && (e.stack || e.message)); });
 void store;
