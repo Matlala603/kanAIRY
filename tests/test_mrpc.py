@@ -3,6 +3,7 @@ Run: python3 tests/test_mrpc.py"""
 import asyncio, json, logging, os, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 os.environ["SESSION_SECRET"] = "x" * 32
+os.environ["MRPC_BROKER_CANDLES"] = "1"; os.environ["MRPC_BROKER_SYMBOLS"] = "1"
 try:
     import httpx  # noqa
 except ImportError:
@@ -39,8 +40,9 @@ class Gateway:
             return httpx.Response(400, json={"type": "TERMINAL_API_TIMEOUT", "errorCode": "TERMINAL_SCRIPT_NOT_POLLING", "errorMessage": "MQL script is not polling commands (last heartbeat was 30s ago)."})
         if path == "/AccountSummary": return httpx.Response(200, json={"balance": 1000, "equity": 1010, "margin": 10, "freeMargin": 1000, "currency": "USD", "leverage": 500, "login": 123456})
         if path == "/OpenedOrders": return httpx.Response(200, json=self.opened)
-        if path == "/SymbolParams": return httpx.Response(200, json={"minVolume": 0.01, "maxVolume": 50, "volumeStep": 0.01, "digits": 5})
-        if path == "/GetQuote": return httpx.Response(200, json={"bid": 1.1, "ask": 1.1002, "time": "2026-10-09T10:00:00Z"})
+        if path == "/SymbolParamsMany" and not q.get("symbol"): return httpx.Response(200, json=["EURUSD", "XAUUSD"])
+        if path == "/SymbolParamsMany": return httpx.Response(200, json={"minVolume": 0.01, "maxVolume": 50, "volumeStep": 0.01, "digits": 5})
+        if path == "/SymbolInfoTick": return httpx.Response(200, json={"bid": 1.1, "ask": 1.1002, "time": "2026-10-09T10:00:00Z"})
         if path == "/Symbols": return httpx.Response(200, json=["EURUSD", "XAUUSD"])
         if path == "/PriceHistory":
             return httpx.Response(200, json=[{"time": "2026-10-09T09:00:00Z", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "tickVolume": 10},
